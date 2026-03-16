@@ -1,0 +1,23 @@
+{
+  "name": "otel-backend",
+  "version": "1.0.0",
+  "description": "Node.js server with MongoDB for storing traces",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "otel",
+    "traces",
+    "mongodb"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.0",
+    "mongoose": "^8.8.0"
+  }
+}
