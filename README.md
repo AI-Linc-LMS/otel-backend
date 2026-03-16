@@ -42,8 +42,32 @@ npm run dev
 | POST | `/api/traces/batch` | Store multiple traces |
 | GET | `/api/traces` | List traces (supports `traceId`, `serviceName`, `startTime`, `endTime`, `limit`) |
 | GET | `/api/traces/trace/:traceId` | Get all spans for a trace |
+| GET | `/api/traces/table` | Paginated table data for Next.js (see below) |
 | GET | `/api/traces/:id` | Get trace by MongoDB _id |
 | GET | `/health` | Health check |
+
+### Table endpoint (for Next.js)
+
+`GET /api/traces/table` returns paginated, sortable rows for a data table.
+
+**Query params:** `page`, `limit` (max 100), `sortBy` (e.g. `startTime`, `name`, `duration`), `order` (`asc`|`desc`), `traceId`, `serviceName`, `startTime`, `endTime`.
+
+**Response:**
+```json
+{
+  "data": [
+    {
+      "id", "traceId", "spanId", "parentSpanId", "name", "kind",
+      "serviceName", "startTime", "endTime", "duration",
+      "statusCode", "statusMessage", "attributes", "createdAt"
+    }
+  ],
+  "total": 100,
+  "page": 1,
+  "limit": 20,
+  "totalPages": 5
+}
+```
 
 ## Trace Schema
 
@@ -70,3 +94,7 @@ curl -X POST http://localhost:3000/api/traces \
     "attributes": [{"key": "http.method", "value": "GET"}]
   }'
 ```
+
+## Netlify deployment
+
+The app runs as a serverless function on Netlify. Set `MONGODB_URI` in the site’s environment variables. All routes are proxied to `/.netlify/functions/server`.

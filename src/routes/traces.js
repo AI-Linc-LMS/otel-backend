@@ -51,24 +51,90 @@ router.post('/batch', async (req, res) => {
   }
 });
 
-// Get trace by ID
-router.get('/:id', async (req, res) => {
+// Table endpoint for Next.js: paginated, sortable rows for UI table
+router.get('/table', async (req, res) => {
   try {
-    const trace = await Trace.findById(req.params.id);
-    if (!trace) return res.status(404).json({ error: 'Trace not found' });
-    res.json(trace);
+    const {
+      page = 1,
+      limit = 20,
+      sortBy = 'startTime',
+      order = 'desc',
+      traceId,
+      serviceName,
+      startTime,
+      endTime,
+    } = req.query;
+
+    const filter = {};
+    if (traceId) filter.traceId = traceId;
+    if (serviceName) filter.serviceName = new RegExp(serviceName, 'i');
+    if (startTime || endTime) {
+      filter.startTime = {};
+      if (startTime) filter.startTime.$gte = new Date(startTime);
+      if (endTime) filter.startTime.$lte = new Date(endTime);
+    }
+
+    const sortOrder = order === 'asc' ? 1 : -1;
+    const sort = { [sortBy]: sortOrder };
+    const skip = (Math.max(1, parseInt(page, 10)) - 1) * Math.min(100, Math.max(1, parseInt(limit, 10)));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10)));
+
+    const [rows, total] = await Promise.all([
+      Trace.find(filter)
+        .sort(sort)
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      Trace.countDocuments(filter),
+    ]);
+
+    const data = rows.map((doc) => ({
+      id: doc._id.toString(),
+      traceId: doc.traceId,
+      spanId: doc.spanId,
+      parentSpanId: doc.parentSpanId ?? null,
+      name: doc.name,
+      kind: doc.kind,
+      serviceName: doc.serviceName ?? null,
+      startTime: doc.startTime,
+      endTime: doc.endTime,
+      duration: doc.duration ?? null,
+      statusCode: doc.status?.code ?? 1,
+      statusMessage: doc.status?.message ?? null,
+      attributes: doc.attributes ?? [],
+      createdAt: doc.createdAt,
+    }));
+
+    res.json({
+      data,
+      total,
+      page: parseInt(page, 10),
+      limit: limitNum,
+      totalPages: Math.ceil(total / limitNum),
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get all spans for a traceId
+// Get all spans for a traceId (must be before /:id)
 router.get('/trace/:traceId', async (req, res) => {
   try {
     const traces = await Trace.find({ traceId: req.params.traceId })
       .sort({ startTime: 1 })
       .lean();
     res.json(traces);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get trace by ID
+router.get('/:id', async (req, res) => {
+  try {
+    const trace = await Trace.findById(req.params.id);
+    if (!trace) return res.status(404).json({ error: 'Trace not found' });
+    res.json(trace);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
