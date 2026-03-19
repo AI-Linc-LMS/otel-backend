@@ -9,6 +9,7 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
     console.log(`Traces API: http://localhost:${PORT}/api/traces`);
+    console.log(`Stats API: http://localhost:${PORT}/api/stats`);
     console.log(`OTLP endpoint: http://localhost:${PORT}/v1/traces`);
   });
 }
