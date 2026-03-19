@@ -55,6 +55,36 @@ function getServiceName(resource) {
   return null;
 }
 
+/** OTLP JSON often sends protobuf enums as strings (e.g. SPAN_KIND_SERVER) — store numeric SpanKind. */
+function normalizeSpanKind(kind) {
+  if (kind === null || kind === undefined) return 1;
+  if (typeof kind === "number" && Number.isFinite(kind)) return kind;
+  const s = String(kind).toUpperCase().replace(/\./g, "_");
+  const map = {
+    SPAN_KIND_UNSPECIFIED: 0,
+    SPAN_KIND_INTERNAL: 1,
+    SPAN_KIND_SERVER: 2,
+    SPAN_KIND_CLIENT: 3,
+    SPAN_KIND_PRODUCER: 4,
+    SPAN_KIND_CONSUMER: 5,
+  };
+  if (map[s] !== undefined) return map[s];
+  const n = parseInt(String(kind), 10);
+  return Number.isNaN(n) ? 1 : n;
+}
+
+/** Same for status code — strings like STATUS_CODE_ERROR */
+function normalizeStatusCode(code) {
+  if (code === null || code === undefined) return 1;
+  if (typeof code === "number" && Number.isFinite(code)) return code;
+  const s = String(code).toUpperCase().replace(/\./g, "_");
+  if (s === "STATUS_CODE_ERROR" || s === "ERROR") return 2;
+  if (s === "STATUS_CODE_OK" || s === "OK") return 1;
+  if (s === "STATUS_CODE_UNSET" || s === "UNSET") return 0;
+  const n = parseInt(String(code), 10);
+  return Number.isNaN(n) ? 1 : n;
+}
+
 /** Convert OTLP span to Trace model document */
 function otlpSpanToDoc(span, serviceName, resource) {
   const startNs = span.startTimeUnixNano ?? span.start_time_unix_nano;
@@ -77,15 +107,19 @@ function otlpSpanToDoc(span, serviceName, resource) {
   }));
 
   const status = span.status || {};
-  const statusCode = status.code ?? status.codeValue ?? 1;
+  const rawStatusCode = status.code ?? status.codeValue ?? 1;
+  const statusCode = normalizeStatusCode(rawStatusCode);
   const statusMessage = status.message ?? status.messageValue ?? null;
+
+  const rawKind = span.kind ?? span.kindValue ?? 1;
+  const kind = normalizeSpanKind(rawKind);
 
   return {
     traceId: span.traceId ?? span.trace_id ?? "",
     spanId: span.spanId ?? span.span_id ?? "",
-    parentSpanId: span.parentSpanId ? span.parent_span_id : null,
+    parentSpanId: span.parentSpanId ?? span.parent_span_id ?? null,
     name: span.name ?? "span",
-    kind: span.kind ?? span.kindValue ?? 1,
+    kind,
     startTime,
     endTime,
     duration,

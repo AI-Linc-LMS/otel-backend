@@ -1,9 +1,9 @@
 /**
  * Analytics / quick stats for dashboards (graphs, KPIs, tables).
  * Query params (all routes):
- *   - from, to: ISO datetimes (default: last 24h)
+ *   - from, to: ISO datetimes (default: last 30 days, STATS_DEFAULT_LOOKBACK_DAYS)
  *   - serviceName: optional filter
- *   - serverOnly: "true" | "false" (default true) — only span kind SERVER (2), typical for HTTP APIs
+ *   - serverOnly: "true" | "false" (default false) — if true, only SERVER spans (kind 2 / SPAN_KIND_SERVER)
  *   - bucket: "minute" | "hour" | "day" (default hour) — for timeseries
  *   - limit: max rows for ranked lists (default 25, max 100)
  *   - httpErrors: "true" | "false" (default true) — count HTTP 4xx/5xx from span attributes as failures
@@ -16,6 +16,18 @@ const router = express.Router();
 
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 25;
+
+/** Default window when from/to omitted (override with STATS_DEFAULT_LOOKBACK_DAYS, max ~10y) */
+function defaultLookbackMs() {
+  const d = parseFloat(process.env.STATS_DEFAULT_LOOKBACK_DAYS);
+  if (!Number.isNaN(d) && d > 0 && d <= 3660) {
+    return d * 24 * 60 * 60 * 1000;
+  }
+  return 30 * 24 * 60 * 60 * 1000;
+}
+
+/** DB may store kind as number 2 or legacy string from OTLP JSON */
+const SPAN_KIND_SERVER_MATCH = [2, '2', 'SPAN_KIND_SERVER'];
 
 function parseBool(v, defaultVal) {
   if (v === undefined || v === null || v === '') return defaultVal;
@@ -30,7 +42,7 @@ function parseRange(req) {
   const to = req.query.to ? new Date(req.query.to) : now;
   const from = req.query.from
     ? new Date(req.query.from)
-    : new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    : new Date(now.getTime() - defaultLookbackMs());
 
   if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
     const err = new Error('Invalid from or to date');
@@ -54,9 +66,49 @@ function baseMatch({ from, to, serviceName, serverOnly }) {
     m.serviceName = new RegExp(String(serviceName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
   }
   if (serverOnly) {
-    m.kind = 2; // OpenTelemetry SpanKind.SERVER
+    m.kind = { $in: SPAN_KIND_SERVER_MATCH };
   }
   return m;
+}
+
+/** Helps debug “all zeros” in prod (time window vs kind filter vs empty DB). */
+async function fetchStatsDiagnostics({ from, to, serviceName, serverOnly }) {
+  const timeOnly = { startTime: { $gte: from, $lte: to } };
+  if (serviceName) {
+    timeOnly.serviceName = new RegExp(
+      String(serviceName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+      'i',
+    );
+  }
+  const fullMatch = baseMatch({ from, to, serviceName, serverOnly });
+
+  const [documentsInTimeRange, documentsAfterFilters, estimatedTotalInCollection] =
+    await Promise.all([
+      Trace.countDocuments(timeOnly),
+      Trace.countDocuments(fullMatch),
+      Trace.estimatedDocumentCount(),
+    ]);
+
+  let hint;
+  if (documentsAfterFilters === 0) {
+    if (documentsInTimeRange > 0) {
+      hint = serverOnly
+        ? 'Spans exist in this time range but none match SERVER kind. Try ?serverOnly=false (many frameworks emit INTERNAL spans), or fix OTLP kind normalization on ingest.'
+        : 'Spans exist in this time range but filters exclude them (check serviceName).';
+    } else if (estimatedTotalInCollection > 0) {
+      hint =
+        'No spans in this time window. Widen the range with ?from=&to= or set STATS_DEFAULT_LOOKBACK_DAYS (default 30 days).';
+    } else {
+      hint = 'No trace documents in the collection.';
+    }
+  }
+
+  return {
+    documentsInTimeRange,
+    documentsAfterFilters,
+    estimatedTotalInCollection,
+    ...(hint ? { hint } : {}),
+  };
 }
 
 function parseBucket(req) {
@@ -150,6 +202,390 @@ function buildFailureDetectionStages(countHttpStatusErrors) {
   ];
 }
 
+/** First attribute value matching any of keys (flat { key, value }[]). */
+function attrFirst(keys) {
+  return {
+    $arrayElemAt: [
+      {
+        $filter: {
+          input: { $ifNull: ['$attributes', []] },
+          as: 'a',
+          cond: { $in: ['$$a.key', keys] },
+        },
+      },
+      0,
+    ],
+  };
+}
+
+/**
+ * After failure stages: set _apiGroupKey — uses http.route/target, url.full/http.url path,
+ * span name patterns "POST /api/...", and comma-joins multiple path hints on one span.
+ */
+function buildApiEndpointGroupStages() {
+  return [
+    {
+      $addFields: {
+        _attrMethod: attrFirst(['http.request.method', 'http.method', '_method']),
+        _attrRoute: attrFirst([
+          'http.route',
+          'http.route.template',
+          'next.route',
+          'aspnetcore.routing.endpoint',
+          'fastapi.route',
+        ]),
+        _attrTarget: attrFirst(['http.target', 'url.path', 'http.path', 'path.template']),
+        _attrUrlFull: attrFirst(['url.full']),
+        _attrHttpUrl: attrFirst(['http.url', 'http.request.url', 'request.url']),
+        _attrGraphql: attrFirst(['graphql.operation.name']),
+        _attrRpc: attrFirst(['rpc.method', 'grpc.method']),
+      },
+    },
+    {
+      $addFields: {
+        _httpMethod: {
+          $toUpper: {
+            $trim: {
+              input: {
+                $convert: {
+                  input: '$_attrMethod.value',
+                  to: 'string',
+                  onError: '',
+                  onNull: '',
+                },
+              },
+            },
+          },
+        },
+        _httpRoute: {
+          $trim: {
+            input: {
+              $convert: {
+                input: '$_attrRoute.value',
+                to: 'string',
+                onError: '',
+                onNull: '',
+              },
+            },
+          },
+        },
+        _httpTarget: {
+          $trim: {
+            input: {
+              $convert: {
+                input: '$_attrTarget.value',
+                to: 'string',
+                onError: '',
+                onNull: '',
+              },
+            },
+          },
+        },
+        _rawUrl: {
+          $let: {
+            vars: {
+              u1: {
+                $trim: {
+                  input: {
+                    $convert: {
+                      input: '$_attrUrlFull.value',
+                      to: 'string',
+                      onError: '',
+                      onNull: '',
+                    },
+                  },
+                },
+              },
+              u2: {
+                $trim: {
+                  input: {
+                    $convert: {
+                      input: '$_attrHttpUrl.value',
+                      to: 'string',
+                      onError: '',
+                      onNull: '',
+                    },
+                  },
+                },
+              },
+            },
+            in: {
+              $cond: [
+                { $gt: [{ $strLenCP: '$$u1' }, 0] },
+                '$$u1',
+                '$$u2',
+              ],
+            },
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        _parsedFromName: {
+          $regexFind: {
+            input: { $ifNull: ['$name', ''] },
+            regex: '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\\s+(.+)$',
+            options: 'i',
+          },
+        },
+        _pathFromFullUrl: {
+          $let: {
+            vars: {
+              u: '$_rawUrl',
+              rf: {
+                $regexFind: {
+                  input: '$_rawUrl',
+                  regex: '^https?://[^/?#]+([^?#]*)',
+                  options: 'i',
+                },
+              },
+            },
+            in: {
+              $let: {
+                vars: {
+                  cap: {
+                    $trim: {
+                      input: {
+                        $ifNull: [{ $arrayElemAt: ['$$rf.captures', 0] }, ''],
+                      },
+                    },
+                  },
+                },
+                in: {
+                  $cond: [
+                    { $gt: [{ $strLenCP: '$$cap' }, 0] },
+                    '$$cap',
+                    {
+                      $cond: [
+                        {
+                          $regexMatch: {
+                            input: { $ifNull: ['$$u', ''] },
+                            regex: '^/',
+                          },
+                        },
+                        {
+                          $trim: {
+                            input: {
+                              $arrayElemAt: [
+                                { $split: [{ $ifNull: ['$$u', ''] }, '?'] },
+                                0,
+                              ],
+                            },
+                          },
+                        },
+                        '',
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        _httpMethodFromName: {
+          $toUpper: {
+            $trim: {
+              input: {
+                $ifNull: [{ $arrayElemAt: ['$_parsedFromName.captures', 0] }, ''],
+              },
+            },
+          },
+        },
+        _httpPathFromName: {
+          $trim: {
+            input: {
+              $arrayElemAt: [
+                {
+                  $split: [
+                    {
+                      $convert: {
+                        input: {
+                          $ifNull: [{ $arrayElemAt: ['$_parsedFromName.captures', 1] }, ''],
+                        },
+                        to: 'string',
+                        onError: '',
+                        onNull: '',
+                      },
+                    },
+                    '?',
+                  ],
+                },
+                0,
+              ],
+            },
+          },
+        },
+        _extraHint: {
+          $let: {
+            vars: {
+              g: {
+                $trim: {
+                  input: {
+                    $convert: {
+                      input: '$_attrGraphql.value',
+                      to: 'string',
+                      onError: '',
+                      onNull: '',
+                    },
+                  },
+                },
+              },
+              r: {
+                $trim: {
+                  input: {
+                    $convert: {
+                      input: '$_attrRpc.value',
+                      to: 'string',
+                      onError: '',
+                      onNull: '',
+                    },
+                  },
+                },
+              },
+            },
+            in: {
+              $cond: [
+                { $gt: [{ $strLenCP: '$$g' }, 0] },
+                '$$g',
+                '$$r',
+              ],
+            },
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        _finalMethod: {
+          $cond: [
+            { $gt: [{ $strLenCP: '$_httpMethod' }, 0] },
+            '$_httpMethod',
+            {
+              $cond: [
+                { $gt: [{ $strLenCP: '$_httpMethodFromName' }, 0] },
+                '$_httpMethodFromName',
+                {
+                  $toUpper: {
+                    $trim: {
+                      input: {
+                        $convert: {
+                          input: { $ifNull: ['$name', ''] },
+                          to: 'string',
+                          onError: '',
+                          onNull: '',
+                        },
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        _pathCandidates: {
+          $filter: {
+            input: [
+              '$_httpRoute',
+              '$_httpTarget',
+              '$_pathFromFullUrl',
+              '$_httpPathFromName',
+              '$_extraHint',
+            ],
+            as: 'p',
+            cond: {
+              $gt: [
+                {
+                  $strLenCP: {
+                    $trim: {
+                      input: {
+                        $convert: {
+                          input: '$$p',
+                          to: 'string',
+                          onError: '',
+                          onNull: '',
+                        },
+                      },
+                    },
+                  },
+                },
+                0,
+              ],
+            },
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        _pathsUnique: { $setUnion: ['$_pathCandidates', []] },
+      },
+    },
+    {
+      $addFields: {
+        _pathsJoined: {
+          $reduce: {
+            input: '$_pathsUnique',
+            initialValue: '',
+            in: {
+              $cond: [
+                { $eq: ['$$value', ''] },
+                { $toString: '$$this' },
+                { $concat: ['$$value', ', ', { $toString: '$$this' }] },
+              ],
+            },
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        _apiGroupKey: {
+          $let: {
+            vars: {
+              m: '$_finalMethod',
+              pj: '$_pathsJoined',
+              n: { $ifNull: ['$name', ''] },
+            },
+            in: {
+              $cond: [
+                { $gt: [{ $strLenCP: '$$pj' }, 0] },
+                {
+                  $trim: {
+                    input: {
+                      $cond: [
+                        { $gt: [{ $strLenCP: '$$m' }, 0] },
+                        { $concat: ['$$m', ' ', '$$pj'] },
+                        '$$pj',
+                      ],
+                    },
+                  },
+                },
+                '$$n',
+              ],
+            },
+          },
+        },
+      },
+    },
+    {
+      $addFields: {
+        _apiGroupKey: {
+          $cond: [
+            { $gt: [{ $strLenCP: { $ifNull: ['$_apiGroupKey', ''] } }, 0] },
+            '$_apiGroupKey',
+            { $ifNull: ['$name', '(unnamed)'] },
+          ],
+        },
+      },
+    },
+  ];
+}
+
 /**
  * GET /api/stats
  * Single payload for dashboards: overview + timeseries + ranked endpoints + by service.
@@ -157,12 +593,13 @@ function buildFailureDetectionStages(countHttpStatusErrors) {
 router.get('/', async (req, res) => {
   try {
     const { from, to } = parseRange(req);
-    const serverOnly = parseBool(req.query.serverOnly, true);
+    const serverOnly = parseBool(req.query.serverOnly, false);
     const serviceName = req.query.serviceName || null;
     const bucket = parseBucket(req);
     const limit = parseLimit(req);
     const countHttpStatusErrors = includeHttpStatusErrors(req);
     const failStages = buildFailureDetectionStages(countHttpStatusErrors);
+    const apiGroupStages = buildApiEndpointGroupStages();
     const $match = baseMatch({ from, to, serviceName, serverOnly });
 
     const [
@@ -171,6 +608,7 @@ router.get('/', async (req, res) => {
       byEndpointFailures,
       byEndpointSlow,
       byService,
+      diagnostics,
     ] = await Promise.all([
       // Overview + percentiles (MongoDB 5.2+)
       Trace.aggregate([
@@ -214,13 +652,16 @@ router.get('/', async (req, res) => {
       Trace.aggregate([
         { $match },
         ...failStages,
+        ...apiGroupStages,
         {
           $group: {
-            _id: '$name',
+            _id: '$_apiGroupKey',
             total: { $sum: 1 },
             failed: { $sum: { $cond: ['$_isFailed', 1, 0] } },
             avgDurationMs: { $avg: '$duration' },
             maxDurationMs: { $max: '$duration' },
+            uniquePathsJoined: { $addToSet: '$_pathsJoined' },
+            distinctSpanNames: { $addToSet: '$name' },
           },
         },
         { $match: { failed: { $gt: 0 } } },
@@ -231,13 +672,16 @@ router.get('/', async (req, res) => {
       Trace.aggregate([
         { $match },
         ...failStages,
+        ...apiGroupStages,
         {
           $group: {
-            _id: '$name',
+            _id: '$_apiGroupKey',
             total: { $sum: 1 },
             failed: { $sum: { $cond: ['$_isFailed', 1, 0] } },
             avgDurationMs: { $avg: '$duration' },
             maxDurationMs: { $max: '$duration' },
+            uniquePathsJoined: { $addToSet: '$_pathsJoined' },
+            distinctSpanNames: { $addToSet: '$name' },
           },
         },
         { $match: { total: { $gte: 1 } } },
@@ -259,6 +703,8 @@ router.get('/', async (req, res) => {
         { $sort: { total: -1 } },
         { $limit: limit },
       ]).exec(),
+
+      fetchStatsDiagnostics({ from, to, serviceName, serverOnly }),
     ]);
 
     const ov = overviewAgg[0] || {};
@@ -291,22 +737,6 @@ router.get('/', async (req, res) => {
       avgDurationMs: round2(row.avgDurationMs),
     }));
 
-    const mapEndpoint = (row) => {
-      const t = row.total || 0;
-      const f = row.failed || 0;
-      const ok = Math.max(0, t - f);
-      return {
-        name: row._id || '(unnamed)',
-        total: t,
-        failed: f,
-        successful: ok,
-        successRatePercent:
-          t > 0 ? Math.round((ok / t) * 10000) / 100 : null,
-        avgDurationMs: round2(row.avgDurationMs),
-        maxDurationMs: row.maxDurationMs ?? null,
-      };
-    };
-
     res.json({
       period: {
         from: from.toISOString(),
@@ -321,8 +751,8 @@ router.get('/', async (req, res) => {
       },
       overview,
       timeSeries,
-      frequentlyFailingApis: byEndpointFailures.map(mapEndpoint),
-      slowestApis: byEndpointSlow.map(mapEndpoint),
+      frequentlyFailingApis: byEndpointFailures.map(formatEndpointAggregationRow),
+      slowestApis: byEndpointSlow.map(formatEndpointAggregationRow),
       byService: byService.map((row) => {
         const t = row.total || 0;
         const f = row.failed || 0;
@@ -337,6 +767,7 @@ router.get('/', async (req, res) => {
           avgDurationMs: round2(row.avgDurationMs),
         };
       }),
+      diagnostics,
     });
   } catch (error) {
     const status = error.status || 500;
@@ -355,13 +786,55 @@ function round2(n) {
   return Math.round(Number(n) * 100) / 100;
 }
 
+/** Group _id is only HTTP verb — append comma-separated paths or span names from the bucket. */
+const METHOD_ONLY_AGG_NAME = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i;
+
+function formatEndpointAggregationRow(row) {
+  const t = row.total || 0;
+  const f = row.failed || 0;
+  const ok = Math.max(0, t - f);
+  const idStr = String(row._id ?? '(unnamed)').trim();
+  let name = idStr;
+
+  const pathVariants = (row.uniquePathsJoined || []).filter(
+    (p) => p != null && String(p).trim().length > 0,
+  );
+  const spanNames = [
+    ...new Set(
+      (row.distinctSpanNames || [])
+        .map((n) => String(n).trim())
+        .filter(Boolean),
+    ),
+  ];
+
+  if (METHOD_ONLY_AGG_NAME.test(idStr)) {
+    if (pathVariants.length > 0) {
+      name = `${idStr} ${pathVariants.join(', ')}`;
+    } else if (spanNames.length > 1) {
+      name = spanNames.join(', ');
+    } else if (spanNames.length === 1 && !METHOD_ONLY_AGG_NAME.test(spanNames[0])) {
+      name = `${idStr} ${spanNames[0]}`;
+    }
+  }
+
+  return {
+    name,
+    total: t,
+    failed: f,
+    successful: ok,
+    successRatePercent: t > 0 ? Math.round((ok / t) * 10000) / 100 : null,
+    avgDurationMs: round2(row.avgDurationMs),
+    maxDurationMs: row.maxDurationMs ?? null,
+  };
+}
+
 /**
  * GET /api/stats/overview — lightweight KPIs only
  */
 router.get('/overview', async (req, res) => {
   try {
     const { from, to } = parseRange(req);
-    const serverOnly = parseBool(req.query.serverOnly, true);
+    const serverOnly = parseBool(req.query.serverOnly, false);
     const serviceName = req.query.serviceName || null;
     const countHttpStatusErrors = includeHttpStatusErrors(req);
     const failStages = buildFailureDetectionStages(countHttpStatusErrors);
@@ -432,7 +905,7 @@ router.get('/overview', async (req, res) => {
 router.get('/timeseries', async (req, res) => {
   try {
     const { from, to } = parseRange(req);
-    const serverOnly = parseBool(req.query.serverOnly, true);
+    const serverOnly = parseBool(req.query.serverOnly, false);
     const serviceName = req.query.serviceName || null;
     const bucket = parseBucket(req);
     const countHttpStatusErrors = includeHttpStatusErrors(req);
@@ -485,12 +958,13 @@ router.get('/timeseries', async (req, res) => {
 router.get('/endpoints', async (req, res) => {
   try {
     const { from, to } = parseRange(req);
-    const serverOnly = parseBool(req.query.serverOnly, true);
+    const serverOnly = parseBool(req.query.serverOnly, false);
     const serviceName = req.query.serviceName || null;
     const limit = parseLimit(req);
     const sort = (req.query.sort || 'failures').toLowerCase();
     const countHttpStatusErrors = includeHttpStatusErrors(req);
     const failStages = buildFailureDetectionStages(countHttpStatusErrors);
+    const apiGroupStages = buildApiEndpointGroupStages();
     const $match = baseMatch({ from, to, serviceName, serverOnly });
 
     const sortStage =
@@ -503,13 +977,16 @@ router.get('/endpoints', async (req, res) => {
     const pipeline = [
       { $match },
       ...failStages,
+      ...apiGroupStages,
       {
         $group: {
-          _id: '$name',
+          _id: '$_apiGroupKey',
           total: { $sum: 1 },
           failed: { $sum: { $cond: ['$_isFailed', 1, 0] } },
           avgDurationMs: { $avg: '$duration' },
           maxDurationMs: { $max: '$duration' },
+          uniquePathsJoined: { $addToSet: '$_pathsJoined' },
+          distinctSpanNames: { $addToSet: '$name' },
         },
       },
       {
@@ -539,21 +1016,7 @@ router.get('/endpoints', async (req, res) => {
         httpErrors: countHttpStatusErrors,
       },
       sort,
-      endpoints: rows.map((row) => {
-        const t = row.total || 0;
-        const f = row.failed || 0;
-        const ok = Math.max(0, t - f);
-        return {
-          name: row._id || '(unnamed)',
-          total: t,
-          failed: f,
-          successful: ok,
-          successRatePercent:
-            t > 0 ? Math.round((ok / t) * 10000) / 100 : null,
-          avgDurationMs: round2(row.avgDurationMs),
-          maxDurationMs: row.maxDurationMs ?? null,
-        };
-      }),
+      endpoints: rows.map(formatEndpointAggregationRow),
     });
   } catch (error) {
     const status = error.status || 500;

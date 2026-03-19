@@ -54,9 +54,13 @@ npm run dev
 
 Use for charts (failed vs success over time, latency) and tables (success rate per route).
 
-**Common query params:** `from`, `to` (ISO dates; default last 24h), `serviceName`, `serverOnly` (`true`|`false`, default `true` = only HTTP server spans, `kind=2`), `limit` (for ranked lists, max 100), `httpErrors` (`true`|`false`, default `true`).
+**Common query params:** `from`, `to` (ISO dates; default window = **30 days** unless `STATS_DEFAULT_LOOKBACK_DAYS` is set), `serviceName`, `serverOnly` (`true`|`false`, default **`false`** — include all span kinds; set `true` for SERVER-only), `limit` (for ranked lists, max 100), `httpErrors` (`true`|`false`, default `true`).
+
+**`GET /api/stats`** includes **`diagnostics`**: `documentsInTimeRange`, `documentsAfterFilters`, `estimatedTotalInCollection`, and a **`hint`** when the matched count is 0 (wrong time range vs kind filter vs empty DB).
 
 **Failures:** By default, a span counts as failed if OpenTelemetry `status.code === 2` **or** the HTTP status in attributes is **400–599** (reads `http.response.status_code` and `http.status_code`). Many SDKs keep span status OK for 403/404, so this makes those visible in stats. Use `httpErrors=false` to count only OTel status ERROR.
+
+Endpoint lists (`frequentlyFailingApis`, `slowestApis`, `/api/stats/endpoints`) build labels from attributes (`http.route`, `http.target`, `url.path`, …), **path parsed from `url.full` / `http.url`**, span names like `POST /api/foo`, plus **comma-joined** path hints when several apply. If the group is still only `GET`/`POST`, the API appends **comma-separated** distinct path strings (or span names) seen in that bucket.
 
 **`GET /api/stats`** returns:
 
