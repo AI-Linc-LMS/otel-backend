@@ -62,6 +62,12 @@ Use for charts (failed vs success over time, latency) and tables (success rate p
 
 Endpoint lists (`frequentlyFailingApis`, `slowestApis`, `/api/stats/endpoints`) build labels from attributes (`http.route`, `http.target`, `url.path`, …), **path parsed from `url.full` / `http.url`**, span names like `POST /api/foo`, plus **comma-joined** path hints when several apply. If the group is still only `GET`/`POST`, the API appends **comma-separated** distinct path strings (or span names) seen in that bucket.
 
+Each row in **`frequentlyFailingApis`**, **`slowestApis`**, and **`/api/stats/endpoints`** includes:
+
+- **`id`** — MongoDB `_id` of a **sample span** (latest `startTime` in that group) → `GET /api/traces/:id`
+- **`traceId`** — same row’s trace → `GET /api/traces/trace/:traceId` (all spans in the trace)
+- **`spanId`** — OpenTelemetry span id on that sample
+
 **`GET /api/stats`** returns:
 
 - `overview` — `totalRequests`, `successfulRequests`, `failedRequests`, `successRatePercent`, `errorRatePercent`, `avgDurationMs`, `min`/`max`, `p50`/`p95`/`p99`

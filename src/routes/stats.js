@@ -8,6 +8,9 @@
  *   - limit: max rows for ranked lists (default 25, max 100)
  *   - httpErrors: "true" | "false" (default true) — count HTTP 4xx/5xx from span attributes as failures
  *     (OTel often leaves span status OK for 403; see http.response.status_code / http.status_code)
+ *
+ * Endpoint rows include id / traceId / spanId: sample = latest span (by startTime) in that bucket.
+ * Frontend: GET /api/traces/:id or GET /api/traces/trace/:traceId
  */
 import express from 'express';
 import { Trace } from '../models/Trace.js';
@@ -653,6 +656,7 @@ router.get('/', async (req, res) => {
         { $match },
         ...failStages,
         ...apiGroupStages,
+        { $sort: { startTime: -1 } },
         {
           $group: {
             _id: '$_apiGroupKey',
@@ -662,6 +666,9 @@ router.get('/', async (req, res) => {
             maxDurationMs: { $max: '$duration' },
             uniquePathsJoined: { $addToSet: '$_pathsJoined' },
             distinctSpanNames: { $addToSet: '$name' },
+            sampleMongoId: { $first: '$_id' },
+            sampleTraceId: { $first: '$traceId' },
+            sampleSpanId: { $first: '$spanId' },
           },
         },
         { $match: { failed: { $gt: 0 } } },
@@ -673,6 +680,7 @@ router.get('/', async (req, res) => {
         { $match },
         ...failStages,
         ...apiGroupStages,
+        { $sort: { startTime: -1 } },
         {
           $group: {
             _id: '$_apiGroupKey',
@@ -682,6 +690,9 @@ router.get('/', async (req, res) => {
             maxDurationMs: { $max: '$duration' },
             uniquePathsJoined: { $addToSet: '$_pathsJoined' },
             distinctSpanNames: { $addToSet: '$name' },
+            sampleMongoId: { $first: '$_id' },
+            sampleTraceId: { $first: '$traceId' },
+            sampleSpanId: { $first: '$spanId' },
           },
         },
         { $match: { total: { $gte: 1 } } },
@@ -817,7 +828,21 @@ function formatEndpointAggregationRow(row) {
     }
   }
 
+  const mongoId = row.sampleMongoId;
+  const id =
+    mongoId != null && typeof mongoId.toString === 'function'
+      ? mongoId.toString()
+      : mongoId != null
+        ? String(mongoId)
+        : null;
+
   return {
+    /** GET /api/traces/:id — latest span in this stats bucket (representative row) */
+    id,
+    /** GET /api/traces/trace/:traceId — full trace for that sample */
+    traceId: row.sampleTraceId ?? null,
+    /** OpenTelemetry span id on the sample document */
+    spanId: row.sampleSpanId ?? null,
     name,
     total: t,
     failed: f,
@@ -978,6 +1003,7 @@ router.get('/endpoints', async (req, res) => {
       { $match },
       ...failStages,
       ...apiGroupStages,
+      { $sort: { startTime: -1 } },
       {
         $group: {
           _id: '$_apiGroupKey',
@@ -987,6 +1013,9 @@ router.get('/endpoints', async (req, res) => {
           maxDurationMs: { $max: '$duration' },
           uniquePathsJoined: { $addToSet: '$_pathsJoined' },
           distinctSpanNames: { $addToSet: '$name' },
+          sampleMongoId: { $first: '$_id' },
+          sampleTraceId: { $first: '$traceId' },
+          sampleSpanId: { $first: '$spanId' },
         },
       },
       {
