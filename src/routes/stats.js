@@ -17,6 +17,49 @@ import { Trace } from '../models/Trace.js';
 
 const router = express.Router();
 
+/** Avoid 32MB in-memory sort limit on large windows; safe for all stats pipelines. */
+function statsAggregate(pipeline) {
+  return Trace.aggregate(pipeline).allowDiskUse(true);
+}
+
+/**
+ * Endpoint buckets: latest span per group via $top (no global $sort on all spans).
+ * Requires MongoDB 5.2+ (same as $percentile on this service).
+ */
+function buildEndpointAggregationGroupAndSampleStages() {
+  return [
+    {
+      $group: {
+        _id: '$_apiGroupKey',
+        total: { $sum: 1 },
+        failed: { $sum: { $cond: ['$_isFailed', 1, 0] } },
+        avgDurationMs: { $avg: '$duration' },
+        maxDurationMs: { $max: '$duration' },
+        uniquePathsJoined: { $addToSet: '$_pathsJoined' },
+        distinctSpanNames: { $addToSet: '$name' },
+        _sample: {
+          $top: {
+            sortBy: { startTime: -1 },
+            output: {
+              mongoId: '$_id',
+              traceId: '$traceId',
+              spanId: '$spanId',
+            },
+          },
+        },
+      },
+    },
+    {
+      $set: {
+        sampleMongoId: '$_sample.mongoId',
+        sampleTraceId: '$_sample.traceId',
+        sampleSpanId: '$_sample.spanId',
+      },
+    },
+    { $unset: '_sample' },
+  ];
+}
+
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 25;
 
@@ -614,7 +657,7 @@ router.get('/', async (req, res) => {
       diagnostics,
     ] = await Promise.all([
       // Overview + percentiles (MongoDB 5.2+)
-      Trace.aggregate([
+      statsAggregate([
         { $match },
         ...failStages,
         {
@@ -636,7 +679,7 @@ router.get('/', async (req, res) => {
         },
       ]).exec(),
 
-      Trace.aggregate([
+      statsAggregate([
         { $match },
         ...failStages,
         {
@@ -652,55 +695,27 @@ router.get('/', async (req, res) => {
         { $sort: { _id: 1 } },
       ]).exec(),
 
-      Trace.aggregate([
+      statsAggregate([
         { $match },
         ...failStages,
         ...apiGroupStages,
-        { $sort: { startTime: -1 } },
-        {
-          $group: {
-            _id: '$_apiGroupKey',
-            total: { $sum: 1 },
-            failed: { $sum: { $cond: ['$_isFailed', 1, 0] } },
-            avgDurationMs: { $avg: '$duration' },
-            maxDurationMs: { $max: '$duration' },
-            uniquePathsJoined: { $addToSet: '$_pathsJoined' },
-            distinctSpanNames: { $addToSet: '$name' },
-            sampleMongoId: { $first: '$_id' },
-            sampleTraceId: { $first: '$traceId' },
-            sampleSpanId: { $first: '$spanId' },
-          },
-        },
+        ...buildEndpointAggregationGroupAndSampleStages(),
         { $match: { failed: { $gt: 0 } } },
         { $sort: { failed: -1, total: -1 } },
         { $limit: limit },
       ]).exec(),
 
-      Trace.aggregate([
+      statsAggregate([
         { $match },
         ...failStages,
         ...apiGroupStages,
-        { $sort: { startTime: -1 } },
-        {
-          $group: {
-            _id: '$_apiGroupKey',
-            total: { $sum: 1 },
-            failed: { $sum: { $cond: ['$_isFailed', 1, 0] } },
-            avgDurationMs: { $avg: '$duration' },
-            maxDurationMs: { $max: '$duration' },
-            uniquePathsJoined: { $addToSet: '$_pathsJoined' },
-            distinctSpanNames: { $addToSet: '$name' },
-            sampleMongoId: { $first: '$_id' },
-            sampleTraceId: { $first: '$traceId' },
-            sampleSpanId: { $first: '$spanId' },
-          },
-        },
+        ...buildEndpointAggregationGroupAndSampleStages(),
         { $match: { total: { $gte: 1 } } },
         { $sort: { avgDurationMs: -1 } },
         { $limit: limit },
       ]).exec(),
 
-      Trace.aggregate([
+      statsAggregate([
         { $match },
         ...failStages,
         {
@@ -865,7 +880,7 @@ router.get('/overview', async (req, res) => {
     const failStages = buildFailureDetectionStages(countHttpStatusErrors);
     const $match = baseMatch({ from, to, serviceName, serverOnly });
 
-    const [row] = await Trace.aggregate([
+    const [row] = await statsAggregate([
       { $match },
       ...failStages,
       {
@@ -937,7 +952,7 @@ router.get('/timeseries', async (req, res) => {
     const failStages = buildFailureDetectionStages(countHttpStatusErrors);
     const $match = baseMatch({ from, to, serviceName, serverOnly });
 
-    const rows = await Trace.aggregate([
+    const rows = await statsAggregate([
       { $match },
       ...failStages,
       {
@@ -1003,21 +1018,7 @@ router.get('/endpoints', async (req, res) => {
       { $match },
       ...failStages,
       ...apiGroupStages,
-      { $sort: { startTime: -1 } },
-      {
-        $group: {
-          _id: '$_apiGroupKey',
-          total: { $sum: 1 },
-          failed: { $sum: { $cond: ['$_isFailed', 1, 0] } },
-          avgDurationMs: { $avg: '$duration' },
-          maxDurationMs: { $max: '$duration' },
-          uniquePathsJoined: { $addToSet: '$_pathsJoined' },
-          distinctSpanNames: { $addToSet: '$name' },
-          sampleMongoId: { $first: '$_id' },
-          sampleTraceId: { $first: '$traceId' },
-          sampleSpanId: { $first: '$spanId' },
-        },
-      },
+      ...buildEndpointAggregationGroupAndSampleStages(),
       {
         $addFields: {
           successful: { $subtract: ['$total', '$failed'] },
@@ -1034,7 +1035,7 @@ router.get('/endpoints', async (req, res) => {
       { $limit: limit },
     ];
 
-    const rows = await Trace.aggregate(pipeline).exec();
+    const rows = await statsAggregate(pipeline).exec();
 
     res.json({
       period: {
